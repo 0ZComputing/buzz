@@ -489,3 +489,311 @@ async fn admins_can_change_labels() {
         vec!["stream", "theirs"]
     );
 }
+
+/// Ensure race: one creator sends two kind:9007s for the same label at
+/// once. The relay keeps both channels, a `#P` + `#t` lookup finds both,
+/// and every reader that follows the NIP-CL rule picks the same one: the
+/// lowest stored creation time, then the lowest ID.
+/// Mutation: rank by the 39000's own created_at after an edit, or let the
+/// lookup miss one channel → RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn racing_creates_resolve_to_the_same_oldest_channel() {
+    let state = state().await;
+    let tenant = community(&state, "group-state-ensure-race").await;
+    let creator = Keys::generate();
+    let extra: &[&[&str]] = &[&["t", "ensure-race"]];
+
+    let (first, second) = tokio::join!(
+        create_channel(&state, &tenant, &creator, extra),
+        create_channel(&state, &tenant, &creator, extra),
+    );
+    assert_ne!(
+        first, second,
+        "both creates must succeed as separate channels"
+    );
+
+    // Edit whichever channel is older so its 39000 becomes the newest event.
+    // Readers must still pick it, because it was created first.
+    let created = |id: Uuid| {
+        let state = state.clone();
+        let tenant = tenant.clone();
+        async move {
+            state
+                .db
+                .get_channel_for_event_write(tenant.community(), id)
+                .await
+                .expect("channel")
+                .created_at
+                .timestamp()
+        }
+    };
+    let mut ranked = [
+        (created(first).await, first.to_string()),
+        (created(second).await, second.to_string()),
+    ];
+    ranked.sort();
+    let expected = ranked[0].1.clone();
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    edit_channel(
+        &state,
+        &tenant,
+        &creator,
+        expected.parse().unwrap(),
+        &[&["about", "edited after the race"]],
+    )
+    .await
+    .expect("edit the older channel");
+
+    // Step 1 of Ensure: the creator's label lookup finds both channels.
+    let found = req_event_ids(
+        &state,
+        &tenant,
+        &creator,
+        serde_json::json!({
+            "kinds": [39000],
+            "#P": [creator.public_key().to_hex()],
+            "#t": ["ensure-race"],
+        }),
+    )
+    .await;
+    assert_eq!(found.len(), 2, "lookup must find both channels: {found:?}");
+
+    let mut events = Vec::new();
+    for id in [first, second] {
+        let stored = state
+            .db
+            .query_events(&EventQuery {
+                kinds: Some(vec![39000]),
+                d_tag: Some(id.to_string()),
+                limit: Some(1),
+                ..EventQuery::for_community(tenant.community())
+            })
+            .await
+            .expect("query 39000");
+        let event = stored.into_iter().next().expect("39000").event;
+        assert!(
+            found.contains(&event.id.to_hex()),
+            "lookup returned the current 39000"
+        );
+        events.push(event);
+    }
+    // NIP-CL "Choosing one channel": the lowest `created_at` tag, then the
+    // lowest channel ID. The edited channel's event is the newest, so this
+    // only works if its tag still holds the stored creation time.
+    let pick = |events: Vec<&nostr::Event>| {
+        events
+            .into_iter()
+            .map(|event| {
+                let created_at = event
+                    .tags
+                    .iter()
+                    .find_map(|tag| match tag.as_slice() {
+                        [name, value, ..] if name == buzz_core::channel::CHANNEL_CREATED_AT_TAG => {
+                            value.parse::<u64>().ok()
+                        }
+                        _ => None,
+                    })
+                    .expect("created_at tag");
+                (
+                    created_at,
+                    event.tags.identifier().expect("d tag").to_owned(),
+                )
+            })
+            .min()
+            .map(|(_, id)| id)
+    };
+    assert_eq!(pick(vec![&events[0], &events[1]]), Some(expected.clone()));
+    assert_eq!(pick(vec![&events[1], &events[0]]), Some(expected));
+}
+
+/// Run one historical REQ as `reader` and return the IDs of the events sent
+/// before EOSE.
+async fn req_event_ids(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    reader: &Keys,
+    filter: serde_json::Value,
+) -> Vec<String> {
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel(256);
+    let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(4);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let conn = Arc::new(crate::connection::ConnectionState {
+        conn_id: Uuid::new_v4(),
+        tenant: tenant.clone(),
+        remote_addr: "127.0.0.1:1234".parse().expect("addr"),
+        auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
+            buzz_auth::AuthContext {
+                pubkey: reader.public_key(),
+                scopes: Vec::new(),
+                channel_ids: None,
+                auth_method: buzz_auth::AuthMethod::Nip42,
+                agent_owner_pubkey: None,
+            },
+        )),
+        subscriptions: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        send_tx,
+        ctrl_tx,
+        terminal_ctrl_tx: tokio::sync::mpsc::channel(1).0,
+        cancel: cancel.clone(),
+        backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        grace_limit: 3,
+        nip_fi_assertion: None,
+        session_deadline: None,
+        nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+        community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
+    });
+    let filter: nostr::Filter = serde_json::from_value(filter).expect("filter");
+    crate::handlers::req::handle_req("g".into(), vec![filter], vec![None], conn, state.clone())
+        .await;
+    let mut ids = Vec::new();
+    while let Ok(frame) = send_rx.try_recv() {
+        let axum::extract::ws::Message::Text(text) = frame else {
+            continue;
+        };
+        let message: serde_json::Value = serde_json::from_str(&text).expect("relay frame");
+        match message[0].as_str() {
+            Some("EVENT") => ids.push(message[2]["id"].as_str().expect("id").to_owned()),
+            Some("EOSE") => return ids,
+            other => panic!("unexpected frame {other:?}: {text}"),
+        }
+    }
+    panic!("no EOSE; events so far: {ids:?}");
+}
+
+/// The current kind:39000 event ID for `channel_id`.
+async fn metadata_event_id(state: &AppState, tenant: &TenantContext, channel_id: Uuid) -> String {
+    state
+        .db
+        .query_events(&EventQuery {
+            kinds: Some(vec![39000]),
+            d_tag: Some(channel_id.to_string()),
+            limit: Some(1),
+            ..EventQuery::for_community(tenant.community())
+        })
+        .await
+        .expect("query 39000")
+        .first()
+        .expect("kind:39000")
+        .event
+        .id
+        .to_hex()
+}
+
+/// A selective `#t` or `#P` REQ on group-state kinds returns its match even
+/// when the match is older than a full page of other channels. The tag
+/// match must run in SQL before `LIMIT`, not after it.
+/// Mutation: drop `group_state_tag_values` from `filter_to_query_params` →
+/// RED (the page holds only the newest unrelated channels).
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn selective_label_and_creator_reqs_are_not_starved_by_limit() {
+    let state = state().await;
+    let tenant = community(&state, "group-state-pushdown").await;
+    let needle_creator = Keys::generate();
+    let other_creator = Keys::generate();
+    let reader = Keys::generate();
+
+    let needle = create_channel(&state, &tenant, &needle_creator, &[&["t", "needle"]]).await;
+    // Group-state created_at has one-second resolution, and rows with the
+    // same second sort by ID, so wait for the next second: then every other
+    // channel's 39000 is strictly newer than the needle's.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for _ in 0..6 {
+        create_channel(&state, &tenant, &other_creator, &[&["t", "hay"]]).await;
+    }
+    let expected = vec![metadata_event_id(&state, &tenant, needle).await];
+
+    assert_eq!(
+        req_event_ids(
+            &state,
+            &tenant,
+            &reader,
+            serde_json::json!({"kinds": [39000], "#t": ["needle"], "limit": 2}),
+        )
+        .await,
+        expected,
+        "#t label match"
+    );
+    assert_eq!(
+        req_event_ids(
+            &state,
+            &tenant,
+            &reader,
+            serde_json::json!({
+                "kinds": [39000],
+                "#P": [needle_creator.public_key().to_hex()],
+                "limit": 2
+            }),
+        )
+        .await,
+        expected,
+        "#P creator match"
+    );
+    assert!(
+        req_event_ids(
+            &state,
+            &tenant,
+            &reader,
+            serde_json::json!({
+                "kinds": [39000],
+                "#P": [needle_creator.public_key().to_hex()],
+                "#t": ["hay"],
+                "limit": 2
+            }),
+        )
+        .await
+        .is_empty(),
+        "#t and #P must both match"
+    );
+}
+
+/// JSONB containment ignores order and repeats, so `[["t", "stream"]]`
+/// contains `[["t", "t"]]` and a channel named `t` (`["name", "t"]`)
+/// contains `[["t", "name"]]`. Those newer channels must not take the only
+/// place in the page from an older channel with the label.
+/// Mutation: drop the exact `EXISTS` match from `push_tag_value_filters` →
+/// RED (each page holds only the newer channel, which the post-filter drops).
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn label_reqs_are_not_starved_by_containment_false_matches() {
+    let state = state().await;
+    let tenant = community(&state, "group-state-containment").await;
+    let creator = Keys::generate();
+    let reader = Keys::generate();
+
+    let labeled_t = create_channel(&state, &tenant, &creator, &[&["t", "t"]]).await;
+    let labeled_name = create_channel(&state, &tenant, &creator, &[&["t", "name"]]).await;
+    let expected_t = vec![metadata_event_id(&state, &tenant, labeled_t).await];
+    let expected_name = vec![metadata_event_id(&state, &tenant, labeled_name).await];
+    // Group-state created_at has one-second resolution; wait so the
+    // unlabeled channel's 39000 is strictly newer.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let unlabeled = create_channel(&state, &tenant, &creator, &[]).await;
+    edit_channel(&state, &tenant, &creator, unlabeled, &[&["name", "t"]])
+        .await
+        .expect("rename to t");
+
+    assert_eq!(
+        req_event_ids(
+            &state,
+            &tenant,
+            &reader,
+            serde_json::json!({"kinds": [39000], "#t": ["t"], "limit": 1}),
+        )
+        .await,
+        expected_t,
+        "label t"
+    );
+    assert_eq!(
+        req_event_ids(
+            &state,
+            &tenant,
+            &reader,
+            serde_json::json!({"kinds": [39000], "#t": ["name"], "limit": 1}),
+        )
+        .await,
+        expected_name,
+        "label name"
+    );
+}

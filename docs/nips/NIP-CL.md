@@ -124,6 +124,31 @@ Values in one tag filter combine with OR, as in NIP-01. So
 `"#t": ["workspace", "notes"]` finds channels with either label. To require a
 label and a creator, use `#t` and `#P` together.
 
+The relay MUST match `#t` and `#P` before it applies `limit`, as NIP-01
+requires. A relay that reads the newest channel events first and matches tags
+after can return a short or empty page while matching channels exist.
+
+## Choosing one channel
+
+The relay does not make labels unique. Many channels can share a label, and
+any owner or admin can set any label. So two creates for the same label can
+both succeed, for example when two processes of one agent start at the same
+time.
+
+A client that needs one channel per creator and label:
+
+1. queries `{"kinds": [39000], "#P": ["<creator>"], "#t": ["<label>"]}`;
+2. creates the channel only if the query returns nothing; and
+3. when the query returns more than one channel, uses the oldest one.
+
+The oldest channel has the lowest `created_at` tag value, compared as an
+integer. If two channels have the same value, the lowest channel ID (`d` tag,
+compared as a string) wins. A channel without a `created_at` tag ranks after
+every channel that has one, and two channels without one compare by channel
+ID.
+Every reader that follows this rule picks the same channel, even after either
+channel is edited.
+
 ## Trust
 
 A client that relies on these tags MUST check that the relay's key signed the
