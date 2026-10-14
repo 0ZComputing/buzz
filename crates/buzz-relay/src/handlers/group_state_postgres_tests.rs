@@ -797,3 +797,139 @@ async fn label_reqs_are_not_starved_by_containment_false_matches() {
         "label name"
     );
 }
+
+/// Whether a group-state tag list has a bare `[name]` marker tag.
+fn has_marker(tags: &[Vec<String>], name: &str) -> bool {
+    tags.iter().any(|tag| tag.len() == 1 && tag[0] == name)
+}
+
+/// A system channel is private unless its creator asks for open, and its
+/// kind:39000 carries NIP-29 `hidden` exactly while it is private.
+/// Mutation: default system channels to open, or drop the `hidden` rule →
+/// RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn system_channel_defaults_private_and_hidden() {
+    let state = state().await;
+    let tenant = community(&state, "group-state-system").await;
+    let creator = Keys::generate();
+
+    let private = create_channel(&state, &tenant, &creator, &[&["channel_type", "system"]]).await;
+    let tags = group_state_tags(&state, &tenant, private, 39000).await;
+    assert!(has_marker(&tags, "private"), "default private: {tags:?}");
+    assert!(
+        has_marker(&tags, "hidden"),
+        "private system is hidden: {tags:?}"
+    );
+    assert_eq!(
+        t_values(&state, &tenant, private, 39000).await.first(),
+        Some(&"system".to_string())
+    );
+
+    edit_channel(
+        &state,
+        &tenant,
+        &creator,
+        private,
+        &[&["visibility", "open"]],
+    )
+    .await
+    .expect("open the channel");
+    let tags = group_state_tags(&state, &tenant, private, 39000).await;
+    assert!(has_marker(&tags, "public"), "opened: {tags:?}");
+    assert!(
+        !has_marker(&tags, "hidden"),
+        "open system is not hidden: {tags:?}"
+    );
+
+    let open = create_channel(
+        &state,
+        &tenant,
+        &creator,
+        &[&["channel_type", "system"], &["visibility", "open"]],
+    )
+    .await;
+    let tags = group_state_tags(&state, &tenant, open, 39000).await;
+    assert!(has_marker(&tags, "public"), "explicit open: {tags:?}");
+    assert!(!has_marker(&tags, "hidden"), "{tags:?}");
+
+    // Other types keep the open default and are not hidden.
+    let stream = create_channel(&state, &tenant, &creator, &[]).await;
+    let tags = group_state_tags(&state, &tenant, stream, 39000).await;
+    assert!(has_marker(&tags, "public"), "{tags:?}");
+    assert!(!has_marker(&tags, "hidden"), "{tags:?}");
+}
+
+/// A kind:9007 without an `h` tag is created by the side-effect handler, not
+/// by the ingest pre-create. That path must give a system channel the same
+/// private default, so strangers can neither read nor write it.
+/// Mutation: default visibility to open in `handle_create_group` → RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn system_channel_without_h_tag_defaults_private() {
+    let state = state().await;
+    let tenant = community(&state, "group-state-system-no-h").await;
+    let creator = Keys::generate();
+    let stranger = Keys::generate();
+
+    let name = format!("system-no-h-{}", Uuid::new_v4().simple());
+    let create = EventBuilder::new(Kind::Custom(9007), "")
+        .tags([
+            Tag::parse(["name", &name]).unwrap(),
+            Tag::parse(["channel_type", "system"]).unwrap(),
+        ])
+        .sign_with_keys(&creator)
+        .expect("sign 9007");
+    let result = ingest_event(&state, &tenant, create, http_auth(&creator))
+        .await
+        .unwrap_or_else(|error| panic!("create channel: {error:?}"));
+    assert!(result.accepted, "{}", result.message);
+
+    let (channel_id, visibility): (Uuid, String) = sqlx::query_as(
+        "SELECT id, visibility::text FROM channels WHERE community_id = $1 AND name = $2",
+    )
+    .bind(*tenant.community().as_uuid())
+    .bind(&name)
+    .fetch_one(state.db.pool())
+    .await
+    .expect("created channel");
+    assert_eq!(visibility, "private");
+
+    let tags = group_state_tags(&state, &tenant, channel_id, 39000).await;
+    assert!(has_marker(&tags, "private"), "{tags:?}");
+    assert!(has_marker(&tags, "hidden"), "{tags:?}");
+    assert!(!has_marker(&tags, "public"), "{tags:?}");
+
+    let stranger_bytes = stranger.public_key().to_bytes().to_vec();
+    assert!(
+        crate::handlers::ingest::check_channel_membership(
+            &tenant,
+            &state,
+            channel_id,
+            &stranger_bytes,
+            None
+        )
+        .await
+        .is_err(),
+        "a stranger must not pass the channel access check"
+    );
+    let readable = state
+        .db
+        .get_accessible_channel_ids(tenant.community(), &stranger_bytes)
+        .await
+        .expect("accessible channels");
+    assert!(!readable.contains(&channel_id), "stranger can read it");
+
+    let message = EventBuilder::new(Kind::Custom(9), "hello")
+        .tags([Tag::parse(["h", &channel_id.to_string()]).unwrap()])
+        .sign_with_keys(&stranger)
+        .unwrap();
+    match ingest_event(&state, &tenant, message, http_auth(&stranger)).await {
+        Ok(result) => assert!(
+            !result.accepted,
+            "stranger wrote to a private system channel: {}",
+            result.message
+        ),
+        Err(error) => assert!(format!("{error:?}").contains("restricted"), "{error:?}"),
+    }
+}
