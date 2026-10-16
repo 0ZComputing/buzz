@@ -482,6 +482,8 @@ async fn insert_event_on(
     let received_at = Utc::now();
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
+    crate::channel_members::guard_channel_roster_event(tx, kind_i32, channel_id, &tags_json)
+        .await?;
     let result = sqlx::query(
         r#"
         INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before)
@@ -1783,6 +1785,9 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     let received_at = Utc::now();
     let d_tag = extract_d_tag(event);
     let not_before = extract_not_before(event);
+
+    crate::channel_members::guard_channel_roster_event(tx, kind_i32, channel_id, &tags_json)
+        .await?;
 
     let result = sqlx::query(
         r#"
