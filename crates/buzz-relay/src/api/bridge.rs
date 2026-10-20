@@ -6834,11 +6834,14 @@ pub(crate) mod postgres_tests {
         // Seed the test actor as "owner" so moderation authz passes.
         let actor_keys = Keys::generate();
         let actor_hex = actor_keys.public_key().to_hex();
-        rt.block_on(
-            state
-                .db
-                .add_relay_member(community.id, &actor_hex, "owner", None),
-        )
+        rt.block_on(state.db.add_relay_member(
+            community.id,
+            &actor_hex,
+            "owner",
+            None,
+            &nostr::Keys::generate(),
+        ))
+        .map(|write| write.outcome)
         .expect("seed actor as owner");
 
         // Build headers: X-Pubkey dev-mode admission (require_auth_token=false).
@@ -8708,7 +8711,8 @@ pub(crate) mod postgres_tests {
             // A schema whose `users` table can be taken away after the link,
             // so only the owner-to-agent lookup fails at revoke time. It
             // carries `communities` and the deletion lock key so writes pass
-            // community write admission.
+            // community write admission, and `events` for the member list
+            // each membership change writes.
             let db_url = crate::test_support::database_url();
             let schema = format!("late_owner_{}", uuid::Uuid::new_v4().simple());
             sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
@@ -8719,6 +8723,7 @@ pub(crate) mod postgres_tests {
                  CREATE TABLE {schema}.join_policy_acceptances \
                      (LIKE public.join_policy_acceptances INCLUDING ALL); \
                  CREATE TABLE {schema}.communities (LIKE public.communities INCLUDING ALL); \
+                 CREATE TABLE {schema}.events (LIKE public.events INCLUDING ALL); \
                  CREATE FUNCTION {schema}.community_deletion_lock_key(target UUID) RETURNS BIGINT \
                  LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT public.community_deletion_lock_key(target)';"
             )))
@@ -8846,13 +8851,20 @@ pub(crate) mod postgres_tests {
                         &owner_hex,
                         "member",
                         None,
+                        &nostr::Keys::generate(),
                     )
                     .await
+                    .map(|write| write.outcome)
                     .expect("seed member");
                     state
                         .db
-                        .remove_relay_member(tenant.community(), &owner_hex)
+                        .remove_relay_member(
+                            tenant.community(),
+                            &owner_hex,
+                            &nostr::Keys::generate(),
+                        )
                         .await
+                        .map(|write| write.outcome)
                         .map(|_| ())
                         .expect("removal commits");
                 }
