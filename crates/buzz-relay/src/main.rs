@@ -1095,63 +1095,21 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     }
     step.finish();
 
-    // NIP-43: reconcile the event-backed roster for every provisioned
-    // community before opening the listener. `relay_members` is canonical;
-    // this repairs pre-snapshot communities and any publication that failed
-    // after a membership transaction committed.
+    // NIP-43: repair event-backed rosters (`relay_members` is canonical) in
+    // the background, on the one replica holding the reconciler leader lock.
+    // It never blocks the listener; see `spawn_nip43_membership_reconciler`.
     if config.require_relay_membership {
-        let mut step = StepTimer::start(StartupStep::Nip43Reconcile);
-        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
-            &state,
-            buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Bootstrap,
-        )
-        .await
-        {
-            Ok(summary) => {
-                if summary.failed > 0 {
-                    step.degrade();
-                }
-                info!(
-                    count = summary.repaired,
-                    failed = summary.failed,
-                    "NIP-43 membership snapshots reconciled on startup"
-                );
-            }
-            Err(error) => {
-                step.degrade();
-                tracing::warn!(%error, "NIP-43 membership snapshot startup reconciliation failed")
-            }
-        }
-        step.finish();
-
-        let reconcile_state = Arc::clone(&state);
         let interval_secs = std::env::var("BUZZ_NIP43_RECONCILE_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60)
             .max(1);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
-                    &reconcile_state,
-                    buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Maintenance,
-                )
-                .await
-                {
-                    Ok(summary) if summary.repaired > 0 => {
-                        info!(count = summary.repaired, "NIP-43 membership snapshots repaired")
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "periodic NIP-43 membership snapshot reconciliation failed"
-                    ),
-                }
-            }
-        });
+        buzz_relay::handlers::side_effects::spawn_nip43_membership_reconciler(
+            Arc::clone(&state),
+            buzz_relay::handlers::side_effects::NIP43_RECONCILE_LOCK_KEY,
+            std::time::Duration::from_secs(interval_secs),
+            buzz_relay::handlers::side_effects::NIP43_STANDBY_RETRY,
+        );
     }
 
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
@@ -2458,7 +2416,7 @@ fn dropped_in_memory_keys(
 async fn run_usage_metrics_tick(
     state: &AppState,
     emission_scope: &EmissionScope,
-    leader: &mut Option<buzz_db::UsageMetricsLeader>,
+    leader: &mut Option<buzz_db::SessionLeader>,
     emitted_in_memory: &mut HashSet<InMemoryMetricKey>,
     fleet_schedule: &mut FleetUsageSchedule,
 ) -> anyhow::Result<()> {
@@ -2500,7 +2458,7 @@ async fn run_usage_metrics_tick(
     if leader.is_none() && !demoted {
         *leader = state
             .db
-            .try_lock_usage_metrics(USAGE_METRICS_LOCK_KEY)
+            .try_lock_session_leader(USAGE_METRICS_LOCK_KEY)
             .await?;
         if leader.is_some() {
             info!("Acquired usage metrics leader lock");
