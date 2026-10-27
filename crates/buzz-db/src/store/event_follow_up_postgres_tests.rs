@@ -338,6 +338,15 @@ async fn assert_contract(migration_schema: bool, arm: Arm) {
     );
     assert_eq!(match_count(&db, community, &reaction).await, 0);
 
+    let gift_wrap = signed_event(&keys, 1059, "gift-wrap");
+    assert!(
+        db.insert_event(community, &gift_wrap, None)
+            .await
+            .expect("insert gift wrap")
+            .1
+    );
+    assert_eq!(match_count(&db, community, &gift_wrap).await, 1);
+
     let no_lease_community = create_community(pool).await;
     let no_lease_message = signed_event(&keys, 9, "no-lease");
     assert!(

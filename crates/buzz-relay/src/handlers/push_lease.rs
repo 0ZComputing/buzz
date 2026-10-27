@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::Digest as _;
 
-/// Message kinds that can produce a mobile Activity-inbox notification.
+/// Message kinds that can produce a mobile Activity-inbox notification, plus
+/// NIP-59 gift wraps (kind 1059) for clients that send end-to-end encrypted
+/// direct messages. A gift-wrap lease must filter on `#p` = its own author
+/// (enforced at match time by `push_filter_authorized_for_event`).
 /// Generic Nostr notes and non-message workflow/agent events are deliberately
 /// excluded from the pre-release testing MVP.
-pub(crate) const PUSH_KINDS: &[u64] = &[9, 40_002, 45_001, 45_003];
+pub(crate) const PUSH_KINDS: &[u64] = &[9, 1_059, 40_002, 45_001, 45_003];
 
 /// NIP-PL addressable push-lease event kind.
 pub const KIND_PUSH_LEASE: u32 = 30_350;
@@ -660,8 +663,11 @@ mod tests {
 
     #[test]
     fn migration_trigger_allowlist_matches_advertised_push_kinds() {
+        // The retired 0040 trigger never carried gift wraps; only the
+        // application producer enqueues them.
         let kinds = PUSH_KINDS
             .iter()
+            .filter(|kind| **kind != 1_059)
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
@@ -670,6 +676,22 @@ mod tests {
         assert!(
             migration.contains(&predicate),
             "migration trigger must use PUSH_KINDS exactly: {predicate}"
+        );
+    }
+
+    #[test]
+    fn gift_wrap_lease_is_push_eligible_only_for_self_p_tag() {
+        let limits = LeaseLimits {
+            push_kinds: PUSH_KINDS,
+            ..limits()
+        };
+        let body = parse_plaintext(r##"{"v":1,"origin":"o","generation":1,"active":true,"transport":"apns","endpoint":"token","subscriptions":[{"filter":{"kinds":[1059],"#p":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},"class":"default"}]}"##, 4096).unwrap();
+        validate_plaintext(&body, &limits).unwrap();
+
+        let body = parse_plaintext(r##"{"v":1,"origin":"o","generation":1,"active":true,"transport":"apns","endpoint":"token","subscriptions":[{"filter":{"kinds":[1059],"#p":["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]},"class":"default"}]}"##, 4096).unwrap();
+        assert_eq!(
+            validate_plaintext(&body, &limits).unwrap_err(),
+            "p-tag must be self"
         );
     }
 

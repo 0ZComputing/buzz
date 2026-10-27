@@ -26,7 +26,7 @@ use crate::{AdmittedTx, DbError, Result};
 
 /// Event kinds that wake push subscribers. Keep identical to the relay's
 /// validated NIP-PL descriptor.
-pub(crate) const PUSH_MATCH_KINDS: [i32; 4] = [9, 40002, 45001, 45003];
+pub(crate) const PUSH_MATCH_KINDS: [i32; 5] = [9, 1059, 40002, 45001, 45003];
 
 /// Kind 9007 creates the channel and initializes its deadline itself.
 const KIND_CHANNEL_CREATE: i32 = 9007;
